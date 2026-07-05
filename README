@@ -1,0 +1,38 @@
+xf86-video-crime - Xorg driver for the SGI O2 CRIME rendering engine
+====================================================================
+
+An Xorg driver for the CRIME rendering engine found in SGI O2
+workstations, based on the NetBSD xsrc driver by Michael Lorenz,
+repackaged with modern autotools and ported to the current
+xorg-server API.
+
+All rendering goes through the CRIME engine: the visible framebuffer
+is tiled and not usefully CPU addressable, so the driver keeps a
+malloc'ed shadow for fb fallbacks and transfers pixels with the XAA
+ImageWrite/ReadPixmap hooks.  An X server with XAA support is
+therefore required.
+
+Backends
+--------
+
+* NetBSD/OpenBSD (wscons): the classic behaviour - the wsdisplay
+  device (default /dev/ttyE0) provides mode switching, colormap,
+  blanking and the hardware cursor, and the engine is mapped through
+  the wsdisplay mmap interface.
+
+* Linux (gbefb): the framebuffer console device (default /dev/fb0,
+  driver "SGI GBE") provides the display information, colormap and
+  blanking; the CRIME engine at physical 0x15000000 and the GBE
+  display backend at 0x16000000 are mapped through /dev/mem.  The
+  32x32 GBE hardware cursor is programmed directly through the
+  CRMFB cursor registers.
+
+The device can be overridden with Option "device" in the Device
+section, or the XDEVICE environment variable.
+
+Building
+--------
+
+  ./autogen.sh --prefix=/usr
+  make
+  make install
