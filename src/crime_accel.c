@@ -546,7 +546,7 @@ CrimeSubsequentColorExpandScanline(ScrnInfoPtr pScrn, int bufno)
 	WRITE4(CRIME_DE_STIPPLE_MODE, 0x001f0000 | (fPtr->start << 24));
 	WRITE4(CRIME_DE_STIPPLE_PAT, *boo);
 	boo++;
-	WRITE4(CRIME_DE_X_VERTEX_0, (x + fPtr->start << 16) | fPtr->uy);
+	WRITE4(CRIME_DE_X_VERTEX_0, ((x + fPtr->start) << 16) | fPtr->uy);
 	WRITE4ST(CRIME_DE_X_VERTEX_1,
 		((x + min(idx, 32) - 1) << 16) | (fPtr->uy));
 	idx -= 32;
