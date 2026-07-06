@@ -1997,10 +1997,11 @@ CrimeValidatePolyPoint(
 {
 
 	if ((pDraw->type == DRAWABLE_WINDOW) ||
-	    IS_OFFSCREEN_PIXMAP(pDraw)) {
+	    IS_OFFSCREEN_PIXMAP(pDraw) ||
+	    PIXMAP_IS_SCREEN(pDraw)) {
 		pGC->ops->PolyPoint = CrimePolyPoint;
 	} else
-		xf86Msg(X_ERROR, "boo\n");	
+		pGC->ops->PolyPoint = XAAGetFallbackOps()->PolyPoint;
 }
 static void
 CrimePolyArc(DrawablePtr pDraw,
@@ -2041,7 +2042,8 @@ CrimeValidatePolyArc(GCPtr pGC,
                        DrawablePtr pDraw)
 {
 	if ((pDraw->type == DRAWABLE_WINDOW) ||
-	    IS_OFFSCREEN_PIXMAP(pDraw)) {
+	    IS_OFFSCREEN_PIXMAP(pDraw) ||
+	    PIXMAP_IS_SCREEN(pDraw)) {
 		pGC->ops->PolyPoint = CrimePolyPoint;
 		/*pGC->ops->PolyArc = miPolyArc;*/
 		pGC->ops->PolyArc = CrimePolyArc;
