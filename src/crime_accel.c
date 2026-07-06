@@ -1293,6 +1293,53 @@ CrimeSubsequentCPUToScreenTextureMask8(
 	DONE(CRIME_DEBUG_XRENDER);
 }
 
+/*
+ * Plain opaque copy to the screen through the DMA staging buffers,
+ * for composites that don't actually blend: PictOpSrc, or PictOpOver
+ * from a format without alpha.  The RGB source mode makes the engine
+ * ignore the (undefined) alpha byte.
+ */
+static void
+CrimeSetupForOpaqueCopy(ScrnInfoPtr pScrn)
+{
+	CrimePtr fPtr = CRIMEPTR(pScrn);
+
+	MAKE_ROOM(7);
+	WRITE4(CRIME_DE_MODE_SRC, DE_MODE_LIN_A | DE_MODE_BUFDEPTH_32 |
+	    DE_MODE_TYPE_RGB | DE_MODE_PIXDEPTH_32);
+	WRITE4(CRIME_DE_MODE_DST, DE_MODE_TLB_A | DE_MODE_BUFDEPTH_32 |
+	    DE_MODE_TYPE_RGBA | DE_MODE_PIXDEPTH_32);
+	WRITE4(CRIME_DE_PLANEMASK, 0xffffffff);
+	WRITE4(CRIME_DE_ROP, GXcopy);
+	WRITE4(CRIME_DE_XFER_STEP_X, 4);
+	WRITE4(CRIME_DE_DRAWMODE,
+	    DE_DRAWMODE_PLANEMASK | DE_DRAWMODE_BYTEMASK | DE_DRAWMODE_ROP |
+	    DE_DRAWMODE_XFER_EN);
+	WRITE4(CRIME_DE_PRIMITIVE,
+	    DE_PRIM_RECTANGLE | DE_PRIM_LR | DE_PRIM_TB);
+	SYNC;
+}
+
+static void
+CrimeOpaqueCopyBox(ScrnInfoPtr pScrn, unsigned char *src, int pitch,
+    int x, int y, int w, int h)
+{
+	CrimePtr fPtr = CRIMEPTR(pScrn);
+	int i, bufnum = 0;
+
+	for (i = 0; i < h; i++) {
+		/* don't queue more lines than there are buffers */
+		SYNC;
+		memcpy(fPtr->buffers[bufnum], src, w << 2);
+		WRITE4(CRIME_DE_XFER_ADDR_SRC, bufnum << 13);
+		WRITE4(CRIME_DE_X_VERTEX_0, (x << 16) | ((y + i) & 0xffff));
+		WRITE4ST(CRIME_DE_X_VERTEX_1,
+		    ((x + w - 1) << 16) | ((y + i) & 0xffff));
+		bufnum = (bufnum + 1) & 7;
+		src += pitch;
+	}
+}
+
 static void
 CrimeDoCPUToScreenComposite(
    	CARD8      op,
@@ -1544,6 +1591,52 @@ CrimeDoCPUToScreenComposite(
 			return;
 		}		
 	} else {	/* no mask */
+
+		/* opaque copies don't need the blending texture path */
+		if ((pSrc->format == PICT_x8r8g8b8 ||
+		     pSrc->format == PICT_a8r8g8b8) &&
+		    (op == PictOpSrc ||
+		     (op == PictOpOver && pSrc->format == PICT_x8r8g8b8)) &&
+		    !pSrc->repeat) {
+			PixmapPtr pPix = (PixmapPtr)(pSrc->pDrawable);
+
+			if (!miComputeCompositeRegion (&region, pSrc, pMask,
+			    pDst, xSrc, ySrc, xMask, yMask, xDst, yDst,
+			    width, height)) {
+				return;
+			}
+
+			nbox = REGION_NUM_RECTS(&region);
+			pbox = REGION_RECTS(&region);
+
+			if(!nbox) {
+				REGION_UNINIT(pScreen, &region);
+				return;
+			}
+
+			CrimeSetupForOpaqueCopy(infoRec->pScrn);
+
+			xSrc -= xDst;
+			ySrc -= yDst;
+
+			while(nbox--) {
+				CrimeOpaqueCopyBox(infoRec->pScrn,
+				    (unsigned char *)pPix->devPrivate.ptr +
+				    (pbox->y1 + ySrc) * pPix->devKind +
+				    ((pbox->x1 + xSrc) << 2),
+				    pPix->devKind,
+				    pbox->x1, pbox->y1,
+				    pbox->x2 - pbox->x1,
+				    pbox->y2 - pbox->y1);
+				pbox++;
+			}
+
+			SET_SYNC_FLAG(infoRec);
+			REGION_UNINIT(pScreen, &region);
+			DONE(CRIME_DEBUG_XRENDER);
+			return;
+		}
+
 		formats = infoRec->CPUToScreenTextureFormats;
 
 		w = pSrc->pDrawable->width;
@@ -1757,8 +1850,6 @@ CrimeComposite(
 			return TRUE;
 		} else {
 			/* CPU-to-screen composite */
-			if (op != PictOpOver)
-				xf86Msg(X_ERROR, "%s: op %d\n", __func__, op);
 			CrimeDoCPUToScreenComposite(op, pSrc, pMask, pDst,
 			    xSrc, ySrc, xMask, yMask,
 			    xDst, yDst, width, height);
