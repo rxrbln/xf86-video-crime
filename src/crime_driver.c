@@ -1128,6 +1128,15 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	if (!crime_compute_layout(pScrn, fPtr))
 		return FALSE;
 	fPtr->vram_lines = fPtr->tile_rows * 128;
+
+	/*
+	 * We cannot pan, so the X screen must start at the initial
+	 * mode's size, not the layout's.  The RandR shim resizes the
+	 * screen on every mode switch (up to the layout maximum kept
+	 * in displayWidth/info.width/height above).
+	 */
+	pScrn->virtualX = pScrn->currentMode->HDisplay;
+	pScrn->virtualY = pScrn->currentMode->VDisplay;
 #else
 	fPtr->vram_lines = 2048;
 
@@ -1228,6 +1237,23 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 
 #ifndef CRIME_WSCONS
 	/*
+	 * On server regeneration the RandR shim resets currentMode to
+	 * the first mode but restores the initial virtual size; the
+	 * screen is created at virtualX/Y, so resync currentMode to it.
+	 */
+	{
+		DisplayModePtr m = pScrn->modes;
+		do {
+			if (m->HDisplay == pScrn->virtualX &&
+			    m->VDisplay == pScrn->virtualY) {
+				pScrn->currentMode = m;
+				break;
+			}
+			m = m->next;
+		} while (m != NULL && m != pScrn->modes);
+	}
+
+	/*
 	 * Set the initial video mode; this also programs the engine
 	 * TLBs before anything touches the apertures.
 	 */
@@ -1243,12 +1269,15 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 	 * ever draws into this shadow, whose content is transferred by
 	 * the XAA ImageWrite/ReadPixmap hooks.
 	 */
-	fPtr->fb = malloc(pScrn->displayWidth * 4 * pScrn->virtualY);
+	/* sized for the layout maximum - RandR may grow the screen */
+	fPtr->fb = malloc(pScrn->displayWidth * 4 * fPtr->info.height);
 	if (fPtr->fb == NULL) {
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
 			   "Cannot allocate shadow fb: %s\n", strerror(errno));
 		return FALSE;
 	}
+	/* rows beyond the initial mode become visible on a RandR grow */
+	memset(fPtr->fb, 0, pScrn->displayWidth * 4 * fPtr->info.height);
 
 	pScrn->vtSema = TRUE;
 
@@ -1298,10 +1327,23 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 		BoxRec bx;
 		fPtr->pXAA = XAACreateInfoRec();
 		CrimeAccelInit(pScrn);
-		bx.x1 = bx.y1 = 0;
+		/*
+		 * Offscreen pixmap area: strictly below the largest
+		 * mode, so a RandR screen grow never exposes it.  The
+		 * area does not touch the (smaller) initial screen, so
+		 * it is handed to the manager as a region directly.
+		 */
+		RegionRec offreg;
+
+		bx.x1 = 0;
+		bx.y1 = fPtr->info.height;
 		bx.x2 = pScrn->displayWidth;
 		bx.y2 = fPtr->vram_lines;
-		xf86InitFBManager(pScreen, &bx);
+		if (bx.y2 < bx.y1)
+			bx.y2 = bx.y1;	/* no offscreen space */
+		RegionInit(&offreg, &bx, 1);
+		xf86InitFBManagerRegion(pScreen, &offreg);
+		RegionUninit(&offreg);
 		if(!XAAInit(pScreen, fPtr->pXAA))
 			return FALSE;
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO, "Using acceleration\n");

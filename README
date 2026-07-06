@@ -59,12 +59,15 @@ Backends
   ranges and Option "MaxClock" from xorg.conf (conservative defaults
   apply when none are given), and by what gbefb itself accepts - it
   computes its dot clock PLL from the modeline, so arbitrary
-  modelines up to 2048x2048, non-interlaced, work.  Modes switch at
-  runtime via Ctrl+Alt+Keypad-Plus/Minus, the XFree86-VidMode
-  extension or RandR; each switch reprograms the GBE timings through
-  FBIOPUT_VSCREENINFO and re-takes the scanout.  The tiled
-  framebuffer is laid out for the largest (virtual) size; smaller
-  modes scan out its top-left corner (no viewport panning).
+  modelines up to 2048x2048, non-interlaced, work.  Modes switch at runtime
+  via RandR (xrandr -s), which resizes the X screen along with the
+  scanout; each switch reprograms the GBE timings through
+  FBIOPUT_VSCREENINFO and re-takes the scanout.  The X server starts
+  at the detected /dev/fb0 mode, while the tiled framebuffer is laid
+  out once for the largest validated mode so RandR can grow the
+  screen later.  The hardware cannot pan, so the Ctrl+Alt+Keypad
+  zoom (which changes only the scanout, not the screen size) is of
+  limited use; prefer xrandr.
 
 The device can be overridden with Option "device" in the Device
 section, or the XDEVICE environment variable.
