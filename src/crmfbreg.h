@@ -185,6 +185,15 @@
 #define		CRMFB_FRM_CONTROL_LINEAR_SHIFT	1
 #define		CRMFB_FRM_CONTROL_TILEPTR_SHIFT	9
 
+/*
+ * the *_INHWCTRL registers mirror the actual hardware state; the DMA
+ * enable bits written to the control registers only take effect at
+ * vertical retrace (names per Linux include/video/gbe.h)
+ */
+#define CRMFB_OVR_INHWCTRL	0x00020004
+#define CRMFB_FRM_INHWCTRL	0x00030008
+#define CRMFB_DID_INHWCTRL	0x00040000
+
 #define CRMFB_DID_PTR		0x00040000
 #define		CRMFB_DID_BASE_MASK		0x0000ffff
 #define 	CRMFB_DID_DMA_ENABLE		0x00010000

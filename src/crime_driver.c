@@ -720,45 +720,93 @@ crime_map_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 static Bool
 crime_wait_dma_idle(CrimePtr fPtr)
 {
-	int bail = 100000;
+	int bail = 10000;
 
-	while (((GBE_READ(fPtr, CRMFB_OVR_CONTROL) & 1) ||
-		(GBE_READ(fPtr, CRMFB_FRM_CONTROL) & 1) ||
-		(GBE_READ(fPtr, CRMFB_DID_CONTROL) & 1)) && bail > 0) {
+	/*
+	 * The DMA enable bits written to the control registers only
+	 * take effect at vertical retrace; the *_INHWCTRL registers
+	 * show the actual state, so poll those (up to two retraces).
+	 */
+	while (((GBE_READ(fPtr, CRMFB_FRM_INHWCTRL) & 1) ||
+		(GBE_READ(fPtr, CRMFB_OVR_INHWCTRL) & 1) ||
+		(GBE_READ(fPtr, CRMFB_DID_INHWCTRL) & 1)) && bail > 0) {
 		usleep(10);
 		bail--;
 	}
 	return bail > 0;
 }
 
-/* Stop the scanout DMA and the dot clock so the FRM setup can be changed */
+/*
+ * Stop the scanout DMA and the dot clock so the FRM setup can be
+ * changed.  This mirrors gbefb's gbe_turn_off(): the pixel counter
+ * must only be frozen in vertical blank, after the DMA engines have
+ * really stopped, or the frame DMA restarts out of phase with the
+ * raster and the image comes up shifted/wrapped.
+ */
 static void
 crime_gbe_stop(ScrnInfoPtr pScrn, CrimePtr fPtr)
 {
-	uint32_t d;
+	uint32_t d, y, vpixen_off;
 	int bail;
+
+	/* already stopped? */
+	if (GBE_READ(fPtr, CRMFB_VT_XY) & (1 << CRMFB_VT_XY_FREEZE_SHIFT))
+		return;
 
 	GBE_WRITE(fPtr, CRMFB_OVR_CONTROL,
 	    GBE_READ(fPtr, CRMFB_OVR_CONTROL) &
 	    ~(1 << CRMFB_OVR_CONTROL_DMAEN_SHIFT));
-	usleep(50000);
+	usleep(1000);
 	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
 	    GBE_READ(fPtr, CRMFB_FRM_CONTROL) &
 	    ~(1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
-	usleep(50000);
+	usleep(1000);
 	GBE_WRITE(fPtr, CRMFB_DID_CONTROL, 0);
-	usleep(50000);
+	usleep(1000);
 
 	if (!crime_wait_dma_idle(fPtr))
 		xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
 			   "timeout waiting for scanout DMA to stop\n");
 
-	/* restart drawing at the top left once DMA is back on */
+	/* wait for the beam to enter vertical blank */
+	vpixen_off = GBE_READ(fPtr, CRMFB_VT_VPIX_EN) &
+	    CRMFB_VPIXEN_OFF_MASK;
+	bail = 100000;
+	while (bail > 0) {
+		y = (GBE_READ(fPtr, CRMFB_VT_XY) &
+		    CRMFB_VT_XY_Y_MASK) >> 12;
+		if (y < vpixen_off)
+			break;
+		usleep(1);
+		bail--;
+	}
+	while (bail > 0) {
+		y = (GBE_READ(fPtr, CRMFB_VT_XY) &
+		    CRMFB_VT_XY_Y_MASK) >> 12;
+		if (y > vpixen_off)
+			break;
+		usleep(1);
+		bail--;
+	}
+	if (bail == 0)
+		xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+			   "timeout waiting for vertical blank\n");
+
+	/* freeze the pixel counter */
 	GBE_WRITE(fPtr, CRMFB_VT_XY, 1 << CRMFB_VT_XY_FREEZE_SHIFT);
-	usleep(1000);
+	usleep(10000);
+	bail = 10000;
+	while (!(GBE_READ(fPtr, CRMFB_VT_XY) &
+	    (1 << CRMFB_VT_XY_FREEZE_SHIFT)) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
+
+	/* stop the dot clock */
 	GBE_WRITE(fPtr, CRMFB_DOTCLOCK,
 	    GBE_READ(fPtr, CRMFB_DOTCLOCK) &
 	    ~(1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT));
+	usleep(10000);
 	bail = 10000;
 	while ((GBE_READ(fPtr, CRMFB_DOTCLOCK) &
 	    (1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT)) && bail > 0) {
@@ -774,16 +822,44 @@ crime_gbe_stop(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	    d & ~(1 << CRMFB_FRM_TILESIZE_FIFOR_SHIFT));
 }
 
+/* Restart the scanout, mirroring gbefb's gbe_turn_on() order */
 static void
 crime_gbe_start(CrimePtr fPtr)
 {
-	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
-	    GBE_READ(fPtr, CRMFB_FRM_CONTROL) |
-	    (1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
-	GBE_WRITE(fPtr, CRMFB_VT_XY, 0);
+	int bail;
+
+	/* dot clock first */
 	GBE_WRITE(fPtr, CRMFB_DOTCLOCK,
 	    GBE_READ(fPtr, CRMFB_DOTCLOCK) |
 	    (1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT));
+	usleep(10000);
+	bail = 10000;
+	while (!(GBE_READ(fPtr, CRMFB_DOTCLOCK) &
+	    (1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT)) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
+
+	/* release the pixel counter, restarting at the top left */
+	GBE_WRITE(fPtr, CRMFB_VT_XY, 0);
+	usleep(10000);
+	bail = 10000;
+	while ((GBE_READ(fPtr, CRMFB_VT_XY) &
+	    (1 << CRMFB_VT_XY_FREEZE_SHIFT)) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
+
+	/* only then enable the frame DMA, and wait for it to latch */
+	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
+	    GBE_READ(fPtr, CRMFB_FRM_CONTROL) |
+	    (1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
+	usleep(1000);
+	bail = 10000;
+	while (!(GBE_READ(fPtr, CRMFB_FRM_INHWCTRL) & 1) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
 }
 
 /*
