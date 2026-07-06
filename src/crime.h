@@ -98,7 +98,12 @@
 #define CRIME_TILE_SIZE		0x10000
 #define CRIME_TILE_MASK		(CRIME_TILE_SIZE - 1)
 
-/* frame buffer characteristics, backend independent */
+/*
+ * Frame buffer layout characteristics, backend independent.  On Linux
+ * width/height describe the virtual (largest mode) area the tiled
+ * framebuffer is laid out for; the currently scanned out mode may be
+ * smaller (mode_width/mode_height below).
+ */
 struct crime_fbinfo {
 	unsigned int		width;
 	unsigned int		height;
@@ -131,6 +136,9 @@ typedef struct {
 	 */
 	unsigned long		smem_start;  /* gbefb video memory */
 	unsigned int		smem_len;
+	struct fb_var_screeninfo var; /* current fbdev state, 32bpp */
+	int			mode_width;  /* current video mode - may be */
+	int			mode_height; /* smaller than the virtual fb */
 	unsigned long		fb_phys;     /* tile aligned framebuffer */
 	unsigned long		linear_phys; /* 128kB DMA staging buffer */
 	unsigned long		table_phys;  /* GBE tile pointer table */

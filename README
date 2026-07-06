@@ -51,6 +51,21 @@ Backends
   extra gbefb memory (up to 16 tile rows) becomes offscreen pixmap
   cache.
 
+  Video modes: the mode gbefb is programmed to at server start is
+  auto-detected from /dev/fb0, always part of the mode pool, and is
+  the startup mode.  The rest of the pool is built with the standard
+  Xorg validation: the Monitor section's modelines and the built-in
+  default modes, limited by the monitor's HorizSync/VertRefresh
+  ranges and Option "MaxClock" from xorg.conf (conservative defaults
+  apply when none are given), and by what gbefb itself accepts - it
+  computes its dot clock PLL from the modeline, so arbitrary
+  modelines up to 2048x2048, non-interlaced, work.  Modes switch at
+  runtime via Ctrl+Alt+Keypad-Plus/Minus, the XFree86-VidMode
+  extension or RandR; each switch reprograms the GBE timings through
+  FBIOPUT_VSCREENINFO and re-takes the scanout.  The tiled
+  framebuffer is laid out for the largest (virtual) size; smaller
+  modes scan out its top-left corner (no viewport panning).
+
 The device can be overridden with Option "device" in the Device
 section, or the XDEVICE environment variable.
 

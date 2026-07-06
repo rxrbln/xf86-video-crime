@@ -48,6 +48,7 @@
 /* all drivers need this */
 #include "xf86.h"
 #include "xf86_OSproc.h"
+#include "xf86Modes.h"
 
 #include "mipointer.h"
 #include "micmap.h"
@@ -294,6 +295,7 @@ crime_get_fbinfo(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	info->width = var.xres;
 	info->height = var.yres;
 	info->depth = var.bits_per_pixel;
+	fPtr->var = var;
 	fPtr->smem_start = fix.smem_start;
 	fPtr->smem_len = fix.smem_len;
 	return TRUE;
@@ -396,6 +398,194 @@ crime_resolve_phys(ScrnInfoPtr pScrn, CrimePtr fPtr)
 		   "video memory at 0x%lx, staging buffer at 0x%lx\n",
 		   fPtr->fb_phys, fPtr->linear_phys);
 	return TRUE;
+}
+
+/*
+ * Translate an X mode into fbdev timings on top of the current gbefb
+ * pixel format.  gbefb computes its dot clock PLL from the requested
+ * pixclock, so arbitrary modelines work as long as the PLL can reach
+ * them.  gbefb cannot pan, so its virtual size always equals the mode;
+ * the (possibly larger) X virtual area only exists in our tiled layout.
+ */
+static void
+crime_mode_to_var(CrimePtr fPtr, DisplayModePtr mode,
+    struct fb_var_screeninfo *var)
+{
+	*var = fPtr->var;
+	var->xres = mode->HDisplay;
+	var->yres = mode->VDisplay;
+	var->xres_virtual = mode->HDisplay;
+	var->yres_virtual = mode->VDisplay;
+	var->xoffset = var->yoffset = 0;
+	var->bits_per_pixel = 32;
+	var->pixclock = mode->Clock ? 1000000000 / mode->Clock : 0;
+	var->right_margin = mode->HSyncStart - mode->HDisplay;
+	var->hsync_len = mode->HSyncEnd - mode->HSyncStart;
+	var->left_margin = mode->HTotal - mode->HSyncEnd;
+	var->lower_margin = mode->VSyncStart - mode->VDisplay;
+	var->vsync_len = mode->VSyncEnd - mode->VSyncStart;
+	var->upper_margin = mode->VTotal - mode->VSyncEnd;
+	var->sync = 0;
+	if (mode->Flags & V_PHSYNC)
+		var->sync |= FB_SYNC_HOR_HIGH_ACT;
+	if (mode->Flags & V_PVSYNC)
+		var->sync |= FB_SYNC_VERT_HIGH_ACT;
+	var->vmode = FB_VMODE_NONINTERLACED;
+}
+
+/* Build an X mode from the fbdev mode gbefb is currently programmed to */
+static void
+crime_var_to_mode(const struct fb_var_screeninfo *var, DisplayModePtr mode)
+{
+	mode->Clock = var->pixclock ? 1000000000 / var->pixclock : 0;
+	mode->SynthClock = mode->Clock;
+	mode->HDisplay = var->xres;
+	mode->HSyncStart = mode->HDisplay + var->right_margin;
+	mode->HSyncEnd = mode->HSyncStart + var->hsync_len;
+	mode->HTotal = mode->HSyncEnd + var->left_margin;
+	mode->VDisplay = var->yres;
+	mode->VSyncStart = mode->VDisplay + var->lower_margin;
+	mode->VSyncEnd = mode->VSyncStart + var->vsync_len;
+	mode->VTotal = mode->VSyncEnd + var->upper_margin;
+	mode->Flags = 0;
+	mode->Flags |= var->sync & FB_SYNC_HOR_HIGH_ACT ?
+	    V_PHSYNC : V_NHSYNC;
+	mode->Flags |= var->sync & FB_SYNC_VERT_HIGH_ACT ?
+	    V_PVSYNC : V_NVSYNC;
+	xf86SetModeDefaultName(mode);
+	xf86SetModeCrtc(mode, 0);
+}
+
+/* Ask gbefb whether it can do this mode, without changing anything */
+static Bool
+crime_test_mode(CrimePtr fPtr, DisplayModePtr mode)
+{
+	struct fb_var_screeninfo var;
+
+	/* the engine TLB A addresses a 2048x2048 pixel area */
+	if (mode->HDisplay > 2048 || mode->VDisplay > 2048)
+		return FALSE;
+	if (mode->Flags & (V_INTERLACE | V_DBLSCAN))
+		return FALSE;
+
+	crime_mode_to_var(fPtr, mode, &var);
+	var.activate = FB_ACTIVATE_TEST;
+	if (ioctl(fPtr->fd, FBIOPUT_VSCREENINFO, &var) == -1)
+		return FALSE;
+	return var.xres == (unsigned int)mode->HDisplay &&
+	    var.yres == (unsigned int)mode->VDisplay &&
+	    var.bits_per_pixel == 32;
+}
+
+/*
+ * Build the mode list with the standard validation machinery: the
+ * monitor's modelines and the server's default modes, filtered by the
+ * frequency limits from xorg.conf (HorizSync/VertRefresh and Option
+ * "MaxClock" in the Monitor section - conservative defaults apply if
+ * none are given) and by what gbefb accepts.  The mode gbefb was
+ * running at server start is always included and is the startup mode.
+ */
+static Bool
+crime_select_modes(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	ClockRangePtr clockRanges;
+	DisplayModePtr mode, builtin;
+	int aperture;
+
+	aperture = (int)fPtr->smem_len - 3 * CRIME_TILE_SIZE;
+	if (aperture < CRIME_TILE_SIZE) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "gbefb video memory too small: %d kB; raise it "
+			   "with the gbefb mem= option\n",
+			   fPtr->smem_len >> 10);
+		return FALSE;
+	}
+
+	/*
+	 * The per-mode memory check in xf86ValidateModes works off
+	 * videoRam (in kB), not the aperture argument; give it the
+	 * usable gbefb memory.  The exact tiled layout is verified in
+	 * crime_compute_layout afterwards.
+	 */
+	pScrn->videoRam = aperture / 1024;
+
+	/* the GBE dot clock PLL: fvco 80-220 MHz, post-divide up to 8 */
+	clockRanges = xnfcalloc(sizeof(ClockRange), 1);
+	clockRanges->minClock = 10000;
+	clockRanges->maxClock = 220000;
+	clockRanges->clockIndex = -1;	/* programmable */
+	clockRanges->interlaceAllowed = FALSE;
+	clockRanges->doubleScanAllowed = FALSE;
+
+	if (xf86ValidateModes(pScrn, pScrn->monitor->Modes,
+	    pScrn->display->modes, clockRanges,
+	    NULL, 128, 2048,		/* pitch range, pixels */
+	    32,				/* pitchInc: any width, bits */
+	    128, 2048,			/* height range */
+	    pScrn->display->virtualX, pScrn->display->virtualY,
+	    aperture, LOOKUP_BEST_REFRESH) == -1)
+		return FALSE;
+	xf86PruneDriverModes(pScrn);
+
+	/*
+	 * Make sure the mode detected on the fbdev at startup is in the
+	 * pool, and start in it.
+	 */
+	builtin = NULL;
+	if ((mode = pScrn->modes) != NULL) {
+		do {
+			if (mode->HDisplay == (int)fPtr->var.xres &&
+			    mode->VDisplay == (int)fPtr->var.yres &&
+			    builtin == NULL)
+				builtin = mode;
+			mode = mode->next;
+		} while (mode != NULL && mode != pScrn->modes);
+	}
+	if (builtin == NULL) {
+		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+			   "adding the current gbefb mode (%dx%d)\n",
+			   fPtr->var.xres, fPtr->var.yres);
+		builtin = xnfcalloc(sizeof(DisplayModeRec), 1);
+		crime_var_to_mode(&fPtr->var, builtin);
+		builtin->type = M_T_BUILTIN;
+		builtin->status = MODE_OK;
+		if (pScrn->modes == NULL) {
+			builtin->prev = builtin->next = builtin;
+			pScrn->modes = builtin;
+		} else {
+			builtin->next = pScrn->modes;
+			builtin->prev = pScrn->modes->prev;
+			pScrn->modes->prev->next = builtin;
+			pScrn->modes->prev = builtin;
+			pScrn->modes = builtin;
+		}
+		if (pScrn->virtualX < builtin->HDisplay)
+			pScrn->virtualX = builtin->HDisplay;
+		if (pScrn->virtualY < builtin->VDisplay)
+			pScrn->virtualY = builtin->VDisplay;
+	}
+	pScrn->currentMode = builtin;
+
+	if (pScrn->virtualX > 2048 || pScrn->virtualY > 2048) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "virtual screen %dx%d exceeds the 2048x2048 "
+			   "engine limit\n", pScrn->virtualX, pScrn->virtualY);
+		return FALSE;
+	}
+
+	/* the tiled framebuffer is laid out for the largest mode */
+	pScrn->displayWidth = pScrn->virtualX;
+	xf86SetCrtcForModes(pScrn, 0);
+	xf86PrintModes(pScrn);
+	return TRUE;
+}
+
+/* mode validation hook for xf86ValidateModes and the VidMode extension */
+static ModeStatus
+CrimeValidMode(ScrnInfoPtr pScrn, DisplayModePtr mode, Bool verbose,
+    int flags)
+{
+	return crime_test_mode(CRIMEPTR(pScrn), mode) ? MODE_OK : MODE_BAD;
 }
 #endif
 
@@ -652,9 +842,20 @@ crime_engine_setup(ScrnInfoPtr pScrn, CrimePtr fPtr)
 		tlb[i >> 3] = 0;
 	WBFLUSH;
 
-	/* GBE tile table: the visible screen, tiles in row major order */
-	for (i = 0; i < fPtr->tiles_x * fPtr->tile_rows; i++)
-		fPtr->table[i] = v + i;
+	/*
+	 * GBE tile table: the tiles of the current mode's viewport, in
+	 * row major order.  The tiled framebuffer is laid out for the
+	 * virtual screen, so rows are tiles_x tiles apart even when the
+	 * mode is narrower.
+	 */
+	col = (fPtr->mode_width + 127) >> 7;
+	k = 0;
+	for (i = 0; i < (fPtr->mode_height + 127) >> 7; i++)
+		for (j = 0; j < col; j++)
+			fPtr->table[k++] = v + i * fPtr->tiles_x + j;
+	/* park any overfetch on a valid tile */
+	while (k < 256)
+		fPtr->table[k++] = v;
 	WBFLUSH;
 
 	if (!fPtr->gbe_saved) {
@@ -669,12 +870,12 @@ crime_engine_setup(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
 	    (fPtr->table_phys >> 9) << CRMFB_FRM_CONTROL_TILEPTR_SHIFT);
 
-	d = (fPtr->info.width >> 7) << CRMFB_FRM_TILESIZE_WIDTH_SHIFT;
-	d |= (((fPtr->info.width & 127) * 4) >> 5) & 0x1f;
+	d = (fPtr->mode_width >> 7) << CRMFB_FRM_TILESIZE_WIDTH_SHIFT;
+	d |= (((fPtr->mode_width & 127) * 4) >> 5) & 0x1f;
 	d |= CRMFB_FRM_TILESIZE_DEPTH_32 << CRMFB_FRM_TILESIZE_DEPTH_SHIFT;
 	GBE_WRITE(fPtr, CRMFB_FRM_TILESIZE, d);
 	GBE_WRITE(fPtr, CRMFB_FRM_PIXSIZE,
-	    fPtr->info.height << CRMFB_FRM_PIXSIZE_HEIGHT_SHIFT);
+	    fPtr->mode_height << CRMFB_FRM_PIXSIZE_HEIGHT_SHIFT);
 
 	crime_gbe_start(fPtr);
 }
@@ -693,6 +894,38 @@ crime_engine_release(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	    fPtr->saved_frm_control &
 	    ~(1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
 	crime_gbe_start(fPtr);
+}
+
+/*
+ * Set a video mode: have gbefb program the display timings for it,
+ * then take the scanout over again in tiled layout.  Requires the
+ * engine/GBE mappings, so this only runs from ScreenInit onwards.
+ */
+static Bool
+crime_set_mode(ScrnInfoPtr pScrn, DisplayModePtr mode)
+{
+	CrimePtr fPtr = CRIMEPTR(pScrn);
+	struct fb_var_screeninfo var;
+
+	crime_mode_to_var(fPtr, mode, &var);
+	var.activate = FB_ACTIVATE_NOW;
+	if (ioctl(fPtr->fd, FBIOPUT_VSCREENINFO, &var) == -1) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "cannot set fb mode %dx%d: %s\n",
+			   mode->HDisplay, mode->VDisplay, strerror(errno));
+		return FALSE;
+	}
+	fPtr->var = var;
+	fPtr->mode_width = mode->HDisplay;
+	fPtr->mode_height = mode->VDisplay;
+
+	/*
+	 * gbefb has just reprogrammed the whole display backend; save
+	 * that state anew for the console before taking over.
+	 */
+	fPtr->gbe_saved = FALSE;
+	crime_engine_setup(pScrn, fPtr);
+	return TRUE;
 }
 #endif /* !CRIME_WSCONS */
 
@@ -776,6 +1009,9 @@ CrimeProbe(DriverPtr drv, int flags)
 			pScrn->PreInit = CrimePreInit;
 			pScrn->ScreenInit = CrimeScreenInit;
 			pScrn->SwitchMode = CrimeSwitchMode;
+#ifndef CRIME_WSCONS
+			pScrn->ValidMode = CrimeValidMode;
+#endif
 			pScrn->AdjustFrame = NULL;
 			pScrn->EnterVT = CrimeEnterVT;
 			pScrn->LeaveVT = CrimeLeaveVT;
@@ -792,7 +1028,9 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	int default_depth;
 	const char *dev;
 	Gamma zeros = {0.0, 0.0, 0.0};
+#ifdef CRIME_WSCONS
 	DisplayModePtr mode;
+#endif
 	MessageType from;
 	rgb rgbzeros = { 0, 0, 0 }, masks;
 
@@ -831,14 +1069,6 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 		return FALSE;
 	}
 
-#ifndef CRIME_WSCONS
-	if (!crime_compute_layout(pScrn, fPtr))
-		return FALSE;
-	fPtr->vram_lines = fPtr->tile_rows * 128;
-#else
-	fPtr->vram_lines = 2048;
-#endif
-
 	/* Handle depth */
 	default_depth = fPtr->info.depth <= 24 ? fPtr->info.depth : 24;
 	if (!xf86SetDepthBpp(pScrn, default_depth, default_depth,
@@ -875,10 +1105,6 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->progClock = TRUE;
 	pScrn->rgbBits   = 8;
 	pScrn->chipset   = "crime";
-	pScrn->videoRam  = fPtr->info.width * 4 * fPtr->vram_lines;
-
-	xf86DrvMsg(pScrn->scrnIndex, X_INFO, "Vidmem: %dk\n",
-		   pScrn->videoRam/1024);
 
 	/* handle options */
 	xf86CollectOptions(pScrn, NULL);
@@ -887,6 +1113,23 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	memcpy(fPtr->Options, CrimeOptions, sizeof(CrimeOptions));
 	xf86ProcessOptions(pScrn->scrnIndex, fPtr->pEnt->device->options,
 			   fPtr->Options);
+
+#ifndef CRIME_WSCONS
+	/*
+	 * Build the mode list: configured modes validated against gbefb,
+	 * with the mode detected on /dev/fb0 as fallback.  The tiled
+	 * framebuffer layout covers the virtual (largest mode) area.
+	 */
+	if (!crime_select_modes(pScrn, fPtr))
+		return FALSE;
+
+	fPtr->info.width = pScrn->virtualX;
+	fPtr->info.height = pScrn->virtualY;
+	if (!crime_compute_layout(pScrn, fPtr))
+		return FALSE;
+	fPtr->vram_lines = fPtr->tile_rows * 128;
+#else
+	fPtr->vram_lines = 2048;
 
 	/* fake video mode struct */
 	mode = (DisplayModePtr)malloc(sizeof(DisplayModeRec));
@@ -915,6 +1158,12 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->virtualX = fPtr->info.width;
 	pScrn->virtualY = fPtr->info.height;
 	pScrn->displayWidth = pScrn->virtualX;
+#endif
+
+	/* the tiled framebuffer actually used, in kB */
+	pScrn->videoRam = fPtr->info.width * 4 * fPtr->vram_lines / 1024;
+	xf86DrvMsg(pScrn->scrnIndex, X_INFO, "Vidmem: %dk\n",
+		   pScrn->videoRam);
 
 	/* Set the display resolution */
 	xf86SetDpi(pScrn, 0, 0);
@@ -978,8 +1227,12 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 		return FALSE;
 
 #ifndef CRIME_WSCONS
-	/* program the engine TLBs before anything touches the apertures */
-	crime_engine_setup(pScrn, fPtr);
+	/*
+	 * Set the initial video mode; this also programs the engine
+	 * TLBs before anything touches the apertures.
+	 */
+	if (!crime_set_mode(pScrn, pScrn->currentMode))
+		return FALSE;
 #endif
 
 	memset(fPtr->linear, 0, CRIME_LINEAR_SIZE);
@@ -990,7 +1243,7 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 	 * ever draws into this shadow, whose content is transferred by
 	 * the XAA ImageWrite/ReadPixmap hooks.
 	 */
-	fPtr->fb = malloc(8192 * fPtr->info.height);
+	fPtr->fb = malloc(pScrn->displayWidth * 4 * pScrn->virtualY);
 	if (fPtr->fb == NULL) {
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
 			   "Cannot allocate shadow fb: %s\n", strerror(errno));
@@ -1046,7 +1299,7 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 		fPtr->pXAA = XAACreateInfoRec();
 		CrimeAccelInit(pScrn);
 		bx.x1 = bx.y1 = 0;
-		bx.x2 = fPtr->info.width;
+		bx.x2 = pScrn->displayWidth;
 		bx.y2 = fPtr->vram_lines;
 		xf86InitFBManager(pScreen, &bx);
 		if(!XAAInit(pScreen, fPtr->pXAA))
@@ -1116,8 +1369,10 @@ CrimeEnterVT(VT_FUNC_ARGS_DECL)
 	pScreenInfo->vtSema = TRUE;
 	crime_set_gfx_mode(CRIMEPTR(pScreenInfo), TRUE);
 #ifndef CRIME_WSCONS
-	/* retake the scanout from fbcon */
-	crime_engine_setup(pScreenInfo, CRIMEPTR(pScreenInfo));
+	/* re-set our mode (fbcon may have changed it) and retake the
+	   scanout */
+	if (!crime_set_mode(pScreenInfo, pScreenInfo->currentMode))
+		return FALSE;
 #endif
 	return TRUE;
 }
@@ -1133,9 +1388,14 @@ CrimeLeaveVT(VT_FUNC_ARGS_DECL)
 static Bool
 CrimeSwitchMode(SWITCH_MODE_ARGS_DECL)
 {
-
+#ifdef CRIME_WSCONS
 	/* Nothing else to do */
 	return TRUE;
+#else
+	SCRN_INFO_PTR(arg);
+
+	return crime_set_mode(pScreenInfo, pMode);
+#endif
 }
 
 static void
