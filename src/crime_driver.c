@@ -478,6 +478,8 @@ crime_map_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 		return FALSE;
 	}
 
+#ifdef CRIME_WSCONS
+	/* the kernel transparently remaps this to the staging RAM */
 	fPtr->linear = crime_mmap(CRIME_LINEAR_SIZE, CRIME_LINEAR_PHYS,
 	    fd, 0);
 	if (fPtr->linear == NULL) {
@@ -485,8 +487,7 @@ crime_map_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 			   "mmap CRIME linear buffer: %s\n", strerror(errno));
 		return FALSE;
 	}
-
-#ifndef CRIME_WSCONS
+#else
 	/* GBE registers: needed to switch the scanout to tiled mode
 	   (and for the hardware cursor) */
 	fPtr->gbe = crime_mmap(CRIME_GBE_SIZE, CRIME_GBE_PHYS, fd, 0);
@@ -499,6 +500,21 @@ crime_map_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	/* the GBE registers tell us where the video memory really is */
 	if (!crime_resolve_phys(pScrn, fPtr))
 		return FALSE;
+
+	/*
+	 * Map the staging buffer RAM directly, exactly like the NetBSD
+	 * kernel's mmap handler hands it to the X driver there.  The CPU
+	 * fills the buffers in RAM and only the engine reads them back
+	 * through its LINEAR_A TLB; the engine's own linear aperture at
+	 * 0x15010000 is not for CPU use.
+	 */
+	fPtr->linear = crime_mmap(CRIME_LINEAR_SIZE, fPtr->linear_phys,
+	    fd, 0);
+	if (fPtr->linear == NULL) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "mmap staging buffer: %s\n", strerror(errno));
+		return FALSE;
+	}
 
 	fPtr->table = crime_mmap(CRIME_TILE_SIZE, fPtr->table_phys, fd, 0);
 	if (fPtr->table == NULL) {
