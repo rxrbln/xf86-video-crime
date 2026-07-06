@@ -2074,7 +2074,7 @@ CrimeAccelInit(ScrnInfoPtr pScrn)
 	
 	pXAAInfo->Flags = /*LINEAR_FRAMEBUFFER |*/ PIXMAP_CACHE | OFFSCREEN_PIXMAPS;
 	pXAAInfo->maxOffPixWidth = fPtr->info.width;
-	pXAAInfo->maxOffPixHeight = 2048;
+	pXAAInfo->maxOffPixHeight = fPtr->vram_lines;
 	
 	/* Sync */
 	pXAAInfo->Sync = CrimeSync;

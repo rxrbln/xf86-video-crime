@@ -252,12 +252,13 @@ crime_check_device(int fd)
 }
 
 static Bool
-crime_get_fbinfo(int fd, struct crime_fbinfo *info)
+crime_get_fbinfo(ScrnInfoPtr pScrn, CrimePtr fPtr)
 {
+	struct crime_fbinfo *info = &fPtr->info;
 #ifdef CRIME_WSCONS
 	struct wsdisplay_fbinfo wsinfo;
 
-	if (ioctl(fd, WSDISPLAYIO_GINFO, &wsinfo) == -1)
+	if (ioctl(fPtr->fd, WSDISPLAYIO_GINFO, &wsinfo) == -1)
 		return FALSE;
 	info->width = wsinfo.width;
 	info->height = wsinfo.height;
@@ -265,15 +266,138 @@ crime_get_fbinfo(int fd, struct crime_fbinfo *info)
 	return TRUE;
 #else
 	struct fb_var_screeninfo var;
+	struct fb_fix_screeninfo fix;
 
-	if (ioctl(fd, FBIOGET_VSCREENINFO, &var) == -1)
+	if (ioctl(fPtr->fd, FBIOGET_VSCREENINFO, &var) == -1)
 		return FALSE;
+
+	/* the rendering engine paths all assume a 32bit framebuffer */
+	if (var.bits_per_pixel != 32) {
+		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+			   "switching fb from %d to 32 bits per pixel\n",
+			   var.bits_per_pixel);
+		var.bits_per_pixel = 32;
+		var.activate = FB_ACTIVATE_NOW;
+		if (ioctl(fPtr->fd, FBIOPUT_VSCREENINFO, &var) == -1 ||
+		    ioctl(fPtr->fd, FBIOGET_VSCREENINFO, &var) == -1 ||
+		    var.bits_per_pixel != 32) {
+			xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+				   "cannot switch fb to 32 bits per pixel, "
+				   "boot with video=gbefb:depth:32\n");
+			return FALSE;
+		}
+	}
+
+	if (ioctl(fPtr->fd, FBIOGET_FSCREENINFO, &fix) == -1)
+		return FALSE;
+
 	info->width = var.xres;
 	info->height = var.yres;
 	info->depth = var.bits_per_pixel;
+	fPtr->smem_start = fix.smem_start;
+	fPtr->smem_len = fix.smem_len;
 	return TRUE;
 #endif
 }
+
+#ifndef CRIME_WSCONS
+
+#define WBFLUSH __asm volatile("sync" ::: "memory")
+
+#define GBE_READ(fPtr, r)	((fPtr)->gbe[(r) >> 2])
+#define GBE_WRITE(fPtr, r, v)	do {			\
+	(fPtr)->gbe[(r) >> 2] = (v);			\
+	WBFLUSH;					\
+} while (0)
+
+/*
+ * Divide the gbefb video memory into the buffers the rendering engine
+ * needs: a framebuffer of full 64kB tiles (visible screen plus
+ * offscreen pixmap space), a 128kB linear DMA staging buffer and one
+ * tile holding the GBE tile pointer table.  Only sizes here - the
+ * physical location is resolved later, when the registers are mapped.
+ */
+static Bool
+crime_compute_layout(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	int vis_rows, rows, tiles;
+
+	fPtr->tiles_x = (fPtr->info.width + 127) >> 7;
+	vis_rows = (fPtr->info.height + 127) >> 7;
+
+	tiles = (fPtr->smem_len >> 16) - 3;
+	rows = tiles / fPtr->tiles_x;
+	if (rows > 16)		/* the engine TLB A is 16x16 tiles */
+		rows = 16;
+	if (tiles < 0 || rows < vis_rows) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "gbefb video memory too small: %d kB, but %dx%d "
+			   "tiled needs %d kB; raise it with the gbefb "
+			   "mem= option\n", fPtr->smem_len >> 10,
+			   fPtr->info.width, fPtr->info.height,
+			   ((vis_rows * fPtr->tiles_x + 3) * CRIME_TILE_SIZE)
+			       >> 10);
+		return FALSE;
+	}
+
+	fPtr->tile_rows = rows;
+	xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+		   "tiled fb layout: %d x %d tiles plus staging buffer\n",
+		   fPtr->tiles_x, rows);
+	return TRUE;
+}
+
+/*
+ * Find the physical location of the gbefb video memory.  gbefb puts a
+ * kernel virtual address into fix.smem_start, so that is useless here;
+ * instead read the scanout tile table GBE is currently using (its
+ * address is in FRM_CONTROL) - the entries hold the real physical
+ * addresses of the 64kB blocks, in sequential order.
+ */
+static Bool
+crime_resolve_phys(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	uint16_t entries[4];
+	unsigned long tabaddr;
+	int i, n;
+
+	tabaddr = GBE_READ(fPtr, CRMFB_FRM_CONTROL) &
+	    ~(unsigned long)((1 << CRMFB_FRM_CONTROL_TILEPTR_SHIFT) - 1);
+	if (tabaddr == 0) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "no GBE tile table - gbefb not initialized?\n");
+		return FALSE;
+	}
+
+	n = fPtr->smem_len >> 16;
+	if (n > 4)
+		n = 4;
+	if (pread(fPtr->memfd, entries, n * sizeof(uint16_t),
+	    (off_t)tabaddr) != (ssize_t)(n * sizeof(uint16_t))) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "cannot read GBE tile table at 0x%lx: %s\n",
+			   tabaddr, strerror(errno));
+		return FALSE;
+	}
+	for (i = 1; i < n; i++) {
+		if (entries[i] != entries[0] + i) {
+			xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+				   "gbefb video memory is not contiguous\n");
+			return FALSE;
+		}
+	}
+
+	fPtr->fb_phys = (unsigned long)entries[0] << 16;
+	fPtr->linear_phys = fPtr->fb_phys +
+	    (unsigned long)fPtr->tile_rows * fPtr->tiles_x * CRIME_TILE_SIZE;
+	fPtr->table_phys = fPtr->linear_phys + 2 * CRIME_TILE_SIZE;
+
+	xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+		   "video memory at 0x%lx, staging buffer at 0x%lx\n",
+		   fPtr->fb_phys, fPtr->linear_phys);
+	return TRUE;
+}
+#endif
 
 /* Switch the console device in and out of graphics mode */
 static Bool
@@ -363,16 +487,198 @@ crime_map_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 	}
 
 #ifndef CRIME_WSCONS
-	/* GBE registers for the hardware cursor; non-fatal, the software
-	   cursor works without them */
+	/* GBE registers: needed to switch the scanout to tiled mode
+	   (and for the hardware cursor) */
 	fPtr->gbe = crime_mmap(CRIME_GBE_SIZE, CRIME_GBE_PHYS, fd, 0);
-	if (fPtr->gbe == NULL)
-		xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-			   "mmap GBE registers failed (%s), "
-			   "no hardware cursor\n", strerror(errno));
+	if (fPtr->gbe == NULL) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "mmap GBE registers: %s\n", strerror(errno));
+		return FALSE;
+	}
+
+	/* the GBE registers tell us where the video memory really is */
+	if (!crime_resolve_phys(pScrn, fPtr))
+		return FALSE;
+
+	fPtr->table = crime_mmap(CRIME_TILE_SIZE, fPtr->table_phys, fd, 0);
+	if (fPtr->table == NULL) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "mmap GBE tile table: %s\n", strerror(errno));
+		return FALSE;
+	}
 #endif
 	return TRUE;
 }
+
+#ifndef CRIME_WSCONS
+static Bool
+crime_wait_dma_idle(CrimePtr fPtr)
+{
+	int bail = 100000;
+
+	while (((GBE_READ(fPtr, CRMFB_OVR_CONTROL) & 1) ||
+		(GBE_READ(fPtr, CRMFB_FRM_CONTROL) & 1) ||
+		(GBE_READ(fPtr, CRMFB_DID_CONTROL) & 1)) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
+	return bail > 0;
+}
+
+/* Stop the scanout DMA and the dot clock so the FRM setup can be changed */
+static void
+crime_gbe_stop(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	uint32_t d;
+	int bail;
+
+	GBE_WRITE(fPtr, CRMFB_OVR_CONTROL,
+	    GBE_READ(fPtr, CRMFB_OVR_CONTROL) &
+	    ~(1 << CRMFB_OVR_CONTROL_DMAEN_SHIFT));
+	usleep(50000);
+	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
+	    GBE_READ(fPtr, CRMFB_FRM_CONTROL) &
+	    ~(1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
+	usleep(50000);
+	GBE_WRITE(fPtr, CRMFB_DID_CONTROL, 0);
+	usleep(50000);
+
+	if (!crime_wait_dma_idle(fPtr))
+		xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+			   "timeout waiting for scanout DMA to stop\n");
+
+	/* restart drawing at the top left once DMA is back on */
+	GBE_WRITE(fPtr, CRMFB_VT_XY, 1 << CRMFB_VT_XY_FREEZE_SHIFT);
+	usleep(1000);
+	GBE_WRITE(fPtr, CRMFB_DOTCLOCK,
+	    GBE_READ(fPtr, CRMFB_DOTCLOCK) &
+	    ~(1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT));
+	bail = 10000;
+	while ((GBE_READ(fPtr, CRMFB_DOTCLOCK) &
+	    (1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT)) && bail > 0) {
+		usleep(10);
+		bail--;
+	}
+
+	/* reset the scanout FIFO */
+	d = GBE_READ(fPtr, CRMFB_FRM_TILESIZE);
+	GBE_WRITE(fPtr, CRMFB_FRM_TILESIZE,
+	    d | (1 << CRMFB_FRM_TILESIZE_FIFOR_SHIFT));
+	GBE_WRITE(fPtr, CRMFB_FRM_TILESIZE,
+	    d & ~(1 << CRMFB_FRM_TILESIZE_FIFOR_SHIFT));
+}
+
+static void
+crime_gbe_start(CrimePtr fPtr)
+{
+	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
+	    GBE_READ(fPtr, CRMFB_FRM_CONTROL) |
+	    (1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
+	GBE_WRITE(fPtr, CRMFB_VT_XY, 0);
+	GBE_WRITE(fPtr, CRMFB_DOTCLOCK,
+	    GBE_READ(fPtr, CRMFB_DOTCLOCK) |
+	    (1 << CRMFB_DOTCLOCK_CLKRUN_SHIFT));
+}
+
+/*
+ * Switch the GBE scanout from gbefb's linear one-tile-wide layout to the
+ * native tiled layout the rendering engine works in, and point the CRIME
+ * engine TLBs at the same memory.  This is what the NetBSD crmfb kernel
+ * driver does at attach time; on Linux nobody else does it for us, and
+ * touching the engine apertures with unprogrammed TLBs raises a hardware
+ * bus error (SIGBUS).
+ */
+static void
+crime_engine_setup(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	volatile uint64_t *tlb;
+	volatile uint32_t *e32;
+	uint64_t reg;
+	uint32_t d, page;
+	uint16_t v;
+	int i, j, k, col;
+
+	/* the engine TLB A: 16 rows of 16 tiles, 4 entries per register */
+	v = (fPtr->fb_phys >> 16) & 0xffff;
+	tlb = (volatile uint64_t *)(fPtr->engine + CRIME_RE_TLB_A);
+	for (i = 0; i < 16; i++) {
+		for (j = 0; j < 4; j++) {
+			reg = 0;
+			for (k = 0; k < 4; k++) {
+				col = (j << 2) | k;
+				if (i < fPtr->tile_rows &&
+				    col < fPtr->tiles_x)
+					reg |= (uint64_t)((v + i *
+					    fPtr->tiles_x + col) | 0x8000)
+					    << ((3 - k) << 4);
+			}
+			tlb[(i << 2) | j] = reg;
+		}
+	}
+
+	/* the staging buffer goes into the first linear TLB, 4kB pages */
+	page = (fPtr->linear_phys >> 12) | 0x80000000;
+	tlb = (volatile uint64_t *)(fPtr->engine + CRIME_RE_LINEAR_A);
+	for (i = 0; i < 16; i++) {
+		tlb[i] = ((uint64_t)page << 32) | (page + 1);
+		page += 2;
+	}
+	WBFLUSH;
+
+	/* basic engine state */
+	e32 = (volatile uint32_t *)fPtr->engine;
+	e32[CRIME_DE_CLIPMODE >> 2] = 0;
+	e32[CRIME_DE_WINOFFSET_SRC >> 2] = 0;
+	e32[CRIME_DE_WINOFFSET_DST >> 2] = 0;
+	e32[CRIME_DE_PLANEMASK >> 2] = 0xffffffff;
+	tlb = (volatile uint64_t *)fPtr->engine;
+	for (i = 0x20; i <= 0x40; i += 8)
+		tlb[i >> 3] = 0;
+	WBFLUSH;
+
+	/* GBE tile table: the visible screen, tiles in row major order */
+	for (i = 0; i < fPtr->tiles_x * fPtr->tile_rows; i++)
+		fPtr->table[i] = v + i;
+	WBFLUSH;
+
+	if (!fPtr->gbe_saved) {
+		fPtr->saved_frm_control = GBE_READ(fPtr, CRMFB_FRM_CONTROL);
+		fPtr->saved_frm_tilesize = GBE_READ(fPtr, CRMFB_FRM_TILESIZE);
+		fPtr->saved_frm_pixsize = GBE_READ(fPtr, CRMFB_FRM_PIXSIZE);
+		fPtr->gbe_saved = TRUE;
+	}
+
+	crime_gbe_stop(pScrn, fPtr);
+
+	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
+	    (fPtr->table_phys >> 9) << CRMFB_FRM_CONTROL_TILEPTR_SHIFT);
+
+	d = (fPtr->info.width >> 7) << CRMFB_FRM_TILESIZE_WIDTH_SHIFT;
+	d |= (((fPtr->info.width & 127) * 4) >> 5) & 0x1f;
+	d |= CRMFB_FRM_TILESIZE_DEPTH_32 << CRMFB_FRM_TILESIZE_DEPTH_SHIFT;
+	GBE_WRITE(fPtr, CRMFB_FRM_TILESIZE, d);
+	GBE_WRITE(fPtr, CRMFB_FRM_PIXSIZE,
+	    fPtr->info.height << CRMFB_FRM_PIXSIZE_HEIGHT_SHIFT);
+
+	crime_gbe_start(fPtr);
+}
+
+/* Hand the scanout back to the layout gbefb set up, for fbcon */
+static void
+crime_engine_release(ScrnInfoPtr pScrn, CrimePtr fPtr)
+{
+	if (!fPtr->gbe_saved)
+		return;
+
+	crime_gbe_stop(pScrn, fPtr);
+	GBE_WRITE(fPtr, CRMFB_FRM_TILESIZE, fPtr->saved_frm_tilesize);
+	GBE_WRITE(fPtr, CRMFB_FRM_PIXSIZE, fPtr->saved_frm_pixsize);
+	GBE_WRITE(fPtr, CRMFB_FRM_CONTROL,
+	    fPtr->saved_frm_control &
+	    ~(1 << CRMFB_FRM_CONTROL_DMAEN_SHIFT));
+	crime_gbe_start(fPtr);
+}
+#endif /* !CRIME_WSCONS */
 
 static void
 crime_unmap_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
@@ -391,6 +697,11 @@ crime_unmap_engine(ScrnInfoPtr pScrn, CrimePtr fPtr)
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
 			   "munmap GBE: %s\n", strerror(errno));
 	fPtr->gbe = NULL;
+	if (fPtr->table &&
+	    munmap((void *)fPtr->table, CRIME_TILE_SIZE) == -1)
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "munmap tile table: %s\n", strerror(errno));
+	fPtr->table = NULL;
 	if (fPtr->memfd != -1) {
 		close(fPtr->memfd);
 		fPtr->memfd = -1;
@@ -497,12 +808,20 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 		return FALSE;
 	}
 
-	if (!crime_get_fbinfo(fPtr->fd, &fPtr->info)) {
+	if (!crime_get_fbinfo(pScrn, fPtr)) {
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
 			   "cannot query framebuffer characteristics: %s\n",
 			   strerror(errno));
 		return FALSE;
 	}
+
+#ifndef CRIME_WSCONS
+	if (!crime_compute_layout(pScrn, fPtr))
+		return FALSE;
+	fPtr->vram_lines = fPtr->tile_rows * 128;
+#else
+	fPtr->vram_lines = 2048;
+#endif
 
 	/* Handle depth */
 	default_depth = fPtr->info.depth <= 24 ? fPtr->info.depth : 24;
@@ -540,7 +859,7 @@ CrimePreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->progClock = TRUE;
 	pScrn->rgbBits   = 8;
 	pScrn->chipset   = "crime";
-	pScrn->videoRam  = fPtr->info.width * 4 * 2048;
+	pScrn->videoRam  = fPtr->info.width * 4 * fPtr->vram_lines;
 
 	xf86DrvMsg(pScrn->scrnIndex, X_INFO, "Vidmem: %dk\n",
 		   pScrn->videoRam/1024);
@@ -642,6 +961,11 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 	if (!crime_map_engine(pScrn, fPtr))
 		return FALSE;
 
+#ifndef CRIME_WSCONS
+	/* program the engine TLBs before anything touches the apertures */
+	crime_engine_setup(pScrn, fPtr);
+#endif
+
 	memset(fPtr->linear, 0, CRIME_LINEAR_SIZE);
 
 	/*
@@ -707,7 +1031,7 @@ CrimeScreenInit(SCREEN_INIT_ARGS_DECL)
 		CrimeAccelInit(pScrn);
 		bx.x1 = bx.y1 = 0;
 		bx.x2 = fPtr->info.width;
-		bx.y2 = 2048;
+		bx.y2 = fPtr->vram_lines;
 		xf86InitFBManager(pScreen, &bx);
 		if(!XAAInit(pScreen, fPtr->pXAA))
 			return FALSE;
@@ -775,6 +1099,10 @@ CrimeEnterVT(VT_FUNC_ARGS_DECL)
 
 	pScreenInfo->vtSema = TRUE;
 	crime_set_gfx_mode(CRIMEPTR(pScreenInfo), TRUE);
+#ifndef CRIME_WSCONS
+	/* retake the scanout from fbcon */
+	crime_engine_setup(pScreenInfo, CRIMEPTR(pScreenInfo));
+#endif
 	return TRUE;
 }
 
@@ -903,6 +1231,9 @@ CrimeRestore(ScrnInfoPtr pScrn)
 	/* the console knows nothing about our hardware cursor - hide it */
 	if (fPtr->gbe)
 		fPtr->gbe[CRMFB_CURSOR_CONTROL >> 2] = 0;
+
+	/* give the scanout back to fbcon's linear layout */
+	crime_engine_release(pScrn, fPtr);
 #endif
 
 	/* Restore the text mode */

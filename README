@@ -27,6 +27,30 @@ Backends
   32x32 GBE hardware cursor is programmed directly through the
   CRMFB cursor registers.
 
+  Unlike NetBSD, where the crmfb kernel driver sets up the CRIME
+  rendering engine at attach time, the Linux gbefb driver only knows
+  about the GBE scanout.  The X driver therefore takes over the
+  hardware itself at ScreenInit:
+
+  - it carves a tile-aligned framebuffer (visible screen plus
+    offscreen pixmap space), a 128kB DMA staging buffer and a GBE
+    tile pointer table out of the physically contiguous gbefb video
+    memory (fix.smem_start/smem_len),
+  - programs the rendering engine's TLB A and first linear TLB with
+    that layout (without this, any access to the engine apertures
+    raises a hardware bus error - "Bus error at address 0x0"),
+  - and switches the GBE scanout from gbefb's linear one-tile-wide
+    trick to the native tiled layout the engine renders into.  The
+    previous state is restored on VT switch and server exit so fbcon
+    keeps working.
+
+  Requirements: a 32bpp mode (the driver switches the fbdev to
+  32bpp itself, or boot with video=gbefb:depth:32) and enough gbefb
+  memory for the tiled screen: e.g. 1280x1024 needs 8 rows of 10
+  tiles (5MB) plus 192kB - boot with gbefb mem=8M or more.  Any
+  extra gbefb memory (up to 16 tile rows) becomes offscreen pixmap
+  cache.
+
 The device can be overridden with Option "device" in the Device
 section, or the XDEVICE environment variable.
 

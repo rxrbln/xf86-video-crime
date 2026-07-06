@@ -94,6 +94,10 @@
 #define CRIME_GBE_PHYS		0x16000000
 #define CRIME_GBE_SIZE		0x00080000
 
+/* GBE/CRIME framebuffer tile: 64kB, 128x128 pixels at 32bpp */
+#define CRIME_TILE_SIZE		0x10000
+#define CRIME_TILE_MASK		(CRIME_TILE_SIZE - 1)
+
 /* frame buffer characteristics, backend independent */
 struct crime_fbinfo {
 	unsigned int		width;
@@ -109,12 +113,35 @@ typedef struct {
 	CloseScreenProcPtr	CloseScreen;
 	EntityInfoPtr		pEnt;
 
+	int			vram_lines; /* on-screen + offscreen height */
+
 #ifdef CRIME_WSCONS
 	struct wsdisplay_cursor cursor;
 	int			maskoffset;
 #else
 	int			memfd; /* /dev/mem for the engine mapping */
-	volatile uint32_t	*gbe;  /* GBE registers, for the hw cursor */
+	volatile uint32_t	*gbe;  /* GBE display backend registers */
+
+	/*
+	 * The Linux gbefb driver knows nothing about the CRIME rendering
+	 * engine, so unlike on NetBSD we must set up the engine's TLBs
+	 * and switch the GBE scanout to the native tiled layout ourselves.
+	 * All buffers are carved out of the (physically contiguous) gbefb
+	 * video memory.
+	 */
+	unsigned long		smem_start;  /* gbefb video memory */
+	unsigned int		smem_len;
+	unsigned long		fb_phys;     /* tile aligned framebuffer */
+	unsigned long		linear_phys; /* 128kB DMA staging buffer */
+	unsigned long		table_phys;  /* GBE tile pointer table */
+	volatile uint16_t	*table;      /* mapped tile pointer table */
+	int			tiles_x;     /* screen width in tiles */
+	int			tile_rows;   /* usable tile rows (max 16) */
+
+	Bool			gbe_saved;   /* saved_* below are valid */
+	uint32_t		saved_frm_control;
+	uint32_t		saved_frm_tilesize;
+	uint32_t		saved_frm_pixsize;
 #endif
 	xf86CursorInfoPtr	CursorInfoRec;
 	OptionInfoPtr		Options;
