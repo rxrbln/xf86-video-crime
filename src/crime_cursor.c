@@ -184,8 +184,12 @@ CrimeSetupCursor(ScreenPtr pScreen)
 
 	infoPtr->MaxWidth = CRIME_CURSOR_SIZE;
 	infoPtr->MaxHeight = CRIME_CURSOR_SIZE;
+	/* the interleave code consumes bits LSB first, like the NetBSD
+	   kernel it was taken from, so ask for MSB first data just like
+	   the wscons backend does */
 	infoPtr->Flags = HARDWARE_CURSOR_AND_SOURCE_WITH_MASK |
-	    HARDWARE_CURSOR_TRUECOLOR_AT_8BPP;
+	    HARDWARE_CURSOR_TRUECOLOR_AT_8BPP |
+	    HARDWARE_CURSOR_BIT_ORDER_MSBFIRST;
 
 	infoPtr->SetCursorColors = CrimeSetCursorColors;
 	infoPtr->SetCursorPosition = CrimeSetCursorPosition;
